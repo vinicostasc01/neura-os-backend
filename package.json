@@ -1,7 +1,7 @@
 {
   "name": "neura-os-backend",
-  "version": "1.0.0",
-  "description": "API backend do NEURA OS (EnergyEngine, Psicologo, Google Fit mock, Tarefas, Estudos, Financeiro).",
+  "version": "1.1.0",
+  "description": "API backend do NEURA OS (EnergyEngine, Psicologo, Google Fit mock, Tarefas, Estudos, Financeiro) com integração OpenAI GPT.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -12,14 +12,16 @@
     "productivity",
     "api",
     "node",
-    "express"
+    "express",
+    "openai"
   ],
   "author": "Vinicius / Vini Graphics",
   "license": "MIT",
   "dependencies": {
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "openai": "^4.57.0"
   },
   "devDependencies": {
     "nodemon": "^3.1.0"
