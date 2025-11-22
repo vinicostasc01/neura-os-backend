@@ -1,17 +1,25 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const OpenAI = require('openai');
 
 const app = express();
 
 // ===== Configurações básicas =====
 const PORT = process.env.PORT || 4000;
 const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || null;
 
 app.use(cors({
   origin: CORS_ORIGIN === '*' ? true : CORS_ORIGIN.split(','),
 }));
 app.use(express.json());
+
+// Cliente OpenAI (usado no psicólogo)
+let openai = null;
+if (OPENAI_API_KEY) {
+  openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+}
 
 // Estado em memória (apenas para testes locais / protótipo)
 const state = {
@@ -51,6 +59,108 @@ function energyLabel(energy) {
   return 'Energia máxima · Excelente para projetos de alto impacto.';
 }
 
+// Fallback de psicólogo (sem GPT)
+function buildPsychResponseFallback({ text, energy, tasks, focusSessions }) {
+  let response = 'Obrigado por compartilhar. Vou considerar isso junto com seus dados de energia, tarefas e sessões de foco. ';
+
+  if (typeof energy === 'number') {
+    if (energy < 40) {
+      response += 'Sua energia está baixa hoje, então é importante reduzir a cobrança interna e priorizar tarefas curtas e simples. ';
+    } else if (energy < 70) {
+      response += 'Sua energia está moderada; é um bom momento para equilibrar coisas operacionais com algum bloco de estudo. ';
+    } else {
+      response += 'Sua energia está alta; ótimo momento para avançar em algo que você vem adiando há um tempo. ';
+    }
+  }
+
+  const urgent = (tasks || []).filter((t) => t.urgency >= 7 && !t.done);
+  if (urgent.length) {
+    response += `Existem ${urgent.length} tarefa(s) com urgência alta acumuladas. Foque em uma por vez em vez de tentar resolver tudo de uma vez. `;
+  }
+
+  const longFocus = (focusSessions || []).filter((s) => s.minutes >= 25);
+  if (longFocus.length) {
+    response += 'Vejo sessões de foco consistentes registradas. Use isso como evidência de que você consegue entrar em estado de concentração novamente. ';
+  }
+
+  response += 'Se possível, escolha conscientemente qual será o próximo passo de hoje, em vez de cair no piloto automático.';
+
+  return response;
+}
+
+// Usa GPT se disponível, senão cai no fallback
+async function buildPsychResponseGPT({ text, energy, tasks, focusSessions }) {
+  if (!openai) {
+    return {
+      source: 'fallback',
+      reply: buildPsychResponseFallback({ text, energy, tasks, focusSessions }),
+    };
+  }
+
+  const resumoTarefas = (tasks || [])
+    .slice(0, 10)
+    .map((t) => `- [${t.done ? 'OK' : 'PENDENTE'}] (${t.urgency}/10 urgência, peso ${t.weight}) ${t.title}`)
+    .join('\n');
+
+  const resumoFoco = (focusSessions || [])
+    .slice(0, 10)
+    .map((s) => `- ${s.title} (${s.minutes} min, energia início: ${s.energyStart ?? 'n/d'})`)
+    .join('\n');
+
+  const systemPrompt = `Você é o psicólogo do sistema NEURA OS.
+Seu papel é orientar o usuário de forma empática, direta e prática,
+ajudando a organizar o dia, reduzir culpa e focar em micro-ações.
+Use linguagem simples, em português brasileiro, e responda em no máximo 3 parágrafos curtos.
+Considere:
+- Nível de energia (0-100)
+- Quantidade de tarefas abertas e urgentes
+- Sessões de foco já feitas
+- Possível sensação de sobrecarga ou procrastinação.
+
+Nunca dê conselhos médicos ou psiquiátricos. Foque em rotina, organização, hábitos saudáveis, descanso e foco.
+`;
+
+  const userPrompt = `Mensagem do usuário:
+"""
+${text || '(sem mensagem específica)'}
+"""
+
+Energia atual: ${energy ?? 'sem dado'}
+
+Resumo de tarefas (máx 10):
+${resumoTarefas || 'nenhuma tarefa registrada.'}
+
+Resumo de sessões de foco (máx 10):
+${resumoFoco || 'nenhuma sessão registrada.'}
+
+Responda como se estivesse conversando direto com o usuário.
+`;
+
+  try {
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ],
+      temperature: 0.7,
+    });
+
+    const reply = completion.choices?.[0]?.message?.content?.trim() || 'Não consegui gerar uma resposta no momento.';
+
+    return {
+      source: 'gpt',
+      reply,
+    };
+  } catch (err) {
+    console.error('Erro ao chamar OpenAI:', err);
+    return {
+      source: 'fallback-error',
+      reply: buildPsychResponseFallback({ text, energy, tasks, focusSessions }),
+    };
+  }
+}
+
 // ===== Rotas básicas =====
 app.get('/', (req, res) => {
   res.json({
@@ -65,13 +175,14 @@ app.get('/api/health', (req, res) => {
     ok: true,
     message: 'NEURA OS API rodando.',
     uptime: process.uptime(),
+    hasOpenAI: !!OPENAI_API_KEY,
     endpoints: [
       '/api/energy/calculate',
       '/api/psychologist/message',
       '/api/google-fit/mock',
       '/api/tasks',
-      '/api/tasks/:id',
-      '/api/focus-sessions'
+      '/api/tasks/:id/toggle',
+      '/api/focus-sessions',
     ],
   });
 });
@@ -201,42 +312,14 @@ app.post('/api/focus-sessions', (req, res) => {
   }
 });
 
-// ===== Psicólogo (mock) =====
-function buildPsychResponse({ text, energy, tasks, focusSessions }) {
-  let response = 'Obrigado por compartilhar. Vou considerar isso junto com seus dados de energia, tarefas e sessões de foco. ';
-
-  if (typeof energy === 'number') {
-    if (energy < 40) {
-      response += 'Sua energia está baixa hoje, então é importante reduzir a cobrança interna e priorizar tarefas curtas e simples. ';
-    } else if (energy < 70) {
-      response += 'Sua energia está moderada; é um bom momento para equilibrar coisas operacionais com algum bloco de estudo. ';
-    } else {
-      response += 'Sua energia está alta; ótimo momento para avançar em algo que você vem adiando há um tempo. ';
-    }
-  }
-
-  const urgent = (tasks || []).filter((t) => t.urgency >= 7 && !t.done);
-  if (urgent.length) {
-    response += `Existem ${urgent.length} tarefa(s) com urgência alta acumuladas. Foque em uma por vez em vez de tentar resolver tudo de uma vez. `;
-  }
-
-  const longFocus = (focusSessions || []).filter((s) => s.minutes >= 25);
-  if (longFocus.length) {
-    response += 'Vejo sessões de foco consistentes registradas. Use isso como evidência de que você consegue entrar em estado de concentração novamente. ';
-  }
-
-  response += 'Se possível, escolha conscientemente qual será o próximo passo de hoje, em vez de cair no piloto automático.';
-
-  return response;
-}
-
-app.post('/api/psychologist/message', (req, res) => {
+// ===== Psicólogo (com GPT) =====
+app.post('/api/psychologist/message', async (req, res) => {
   try {
     const { text = '', energy = null } = req.body || {};
     const tasks = state.tasks;
     const focusSessions = state.focusSessions;
 
-    const reply = buildPsychResponse({
+    const result = await buildPsychResponseGPT({
       text,
       energy: energy == null ? null : Number(energy),
       tasks,
@@ -245,7 +328,8 @@ app.post('/api/psychologist/message', (req, res) => {
 
     res.json({
       userMessage: text,
-      reply,
+      reply: result.reply,
+      source: result.source,
       meta: {
         energy,
         tasksOpen: tasks.filter((t) => !t.done).length,
@@ -262,4 +346,7 @@ app.post('/api/psychologist/message', (req, res) => {
 // ===== Inicia o servidor =====
 app.listen(PORT, () => {
   console.log(`NEURA OS API rodando na porta ${PORT}`);
+  if (!OPENAI_API_KEY) {
+    console.warn('ATENÇÃO: OPENAI_API_KEY não definida. O psicólogo usará apenas o fallback sem GPT.');
+  }
 });
